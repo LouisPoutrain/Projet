@@ -7,9 +7,10 @@ Objectif:
 - Sélectionner le meilleur modèle par cible (rb1, bb2, ..., bp5, rp5).
 - Sauvegarder un "bundle" réutilisable pour l'inférence: modèle + OneHotEncoder + LabelEncoder
     + feature_cols + métadonnées.
+- Enregistrer tous les résultats de comparaison (par cible et par modèle) dans un CSV.
 """
 
-import os 
+import os
 import sys
 import argparse
 import pickle
@@ -377,6 +378,62 @@ class ModelComparator:
         
         return results_for_target
     
+    @staticmethod
+    def _flatten_dict(d: dict | None, prefix: str) -> dict:
+        """Aplati un dict (1 niveau) en colonnes préfixées (utile pour cv_results)."""
+        if not isinstance(d, dict):
+            return {}
+        return {f"{prefix}{k}": v for k, v in d.items()}
+
+    def export_results_to_csv(self, csv_path: str | Path):
+        """
+        Exporte TOUS les résultats (par target x modèle) dans un CSV.
+
+        Colonnes typiques:
+          - target, model_name, is_best
+          - accuracy, f1_macro, precision, recall
+          - cv_* (si dispo)
+          - n_samples, n_classes, n_features, feature_cols
+        """
+        rows = []
+
+        for target, models_results in (self.results or {}).items():
+            if not models_results:
+                continue
+
+            artifacts = models_results.get("_artifacts", {})
+            model_keys = self._model_keys(models_results)
+            if not model_keys:
+                continue
+
+            # Meilleur modèle selon la même règle que le bundle (F1 macro)
+            best_model_name = max(model_keys, key=lambda x: models_results[x].get("f1_macro", -1))
+
+            for model_name in model_keys:
+                entry = models_results.get(model_name, {}) or {}
+                cv = entry.get("cv_results")
+
+                rows.append({
+                    "target": target,
+                    "model_name": model_name,
+                    "is_best": model_name == best_model_name,
+                    "accuracy": entry.get("accuracy"),
+                    "f1_macro": entry.get("f1_macro"),
+                    "precision": entry.get("precision"),
+                    "recall": entry.get("recall"),
+                    **self._flatten_dict(cv, "cv_"),
+                    "n_samples": artifacts.get("n_samples"),
+                    "n_classes": artifacts.get("n_classes"),
+                    "n_features": int(artifacts.get("X_encoded").shape[1]) if artifacts.get("X_encoded") is not None else None,
+                    "feature_cols": "|".join(artifacts.get("feature_cols", []) or []),
+                })
+
+        df_out = pd.DataFrame(rows)
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df_out.to_csv(csv_path, index=False, encoding="utf-8")
+        print(f"\n🧾 Résultats complets exportés en CSV: {csv_path}")
+
     def run_full_evaluation(
         self,
         num_targets=None,
@@ -384,6 +441,7 @@ class ModelComparator:
         output_dir: str | None = None,
         save_progressively: bool = True,
         skip_if_legacy_model_exists: bool = True,
+        results_csv_path: str | None = None,
     ):
         """
         Évalue les modèles sur les cibles de draft.
@@ -410,16 +468,25 @@ class ModelComparator:
                 if skip_if_legacy_model_exists and legacy_path.exists():
                     print(f"\n⏭️  Skip {target}: legacy model présent ({legacy_path})")
                     continue
+
             result = self.compare_models_for_target(target, features, verbose=True)
             self.results[target] = result
 
             if save_progressively and out_dir_path is not None and result:
                 # Sauvegarde le meilleur bundle immédiatement pour ne pas perdre le progrès
                 self._save_best_bundle_for_target(target, result, str(out_dir_path))
-        
+
         # Résumé final
         self.print_summary()
-    
+
+        # --- NOUVEAU: export CSV de tous les résultats ---
+        if results_csv_path:
+            self.export_results_to_csv(results_csv_path)
+        else:
+            # Par défaut: dans output_dir si fourni, sinon à la racine/models/improved_models
+            default_dir = out_dir_path if out_dir_path is not None else (self._project_root() / "models" / "improved_models")
+            self.export_results_to_csv(default_dir / "model_comparison_results.csv")
+
     def print_summary(self):
         """
         Affiche un résumé des résultats.
@@ -484,6 +551,13 @@ def main():
         default=None,
         help="Dossier de sortie pour les bundles (par défaut: models/improved_models à la racine)",
     )
+    # --- NOUVEAU ---
+    parser.add_argument(
+        "--results-csv",
+        type=str,
+        default=None,
+        help="Chemin de sortie du CSV récapitulatif (par défaut: <output-dir>/model_comparison_results.csv).",
+    )
     parser.add_argument(
         "--only-missing",
         action="store_true",
@@ -537,6 +611,7 @@ def main():
         output_dir=effective_output_dir,
         save_progressively=not args.no_progress_save,
         skip_if_legacy_model_exists=not args.no_skip_legacy,
+        results_csv_path=args.results_csv,
     )
     
     # Sauvegarde les meilleurs modèles

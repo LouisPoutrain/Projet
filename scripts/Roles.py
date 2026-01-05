@@ -2,6 +2,19 @@
 Main script for LoL esports draft prediction.
 Uses modular components: predictor.py, evaluator.py, utils_roles.py
 """
+
+import warnings
+
+# Masque uniquement les warnings de version incohérente lors du chargement de modèles sklearn
+try:
+    from sklearn.exceptions import InconsistentVersionWarning
+    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+except Exception:
+    # Fallback si la classe n'existe pas / import impossible
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Trying to unpickle estimator .* from version .* when using version .*",
+    )
 from pathlib import Path
 import pandas as pd
 from predictor import DraftPredictor
@@ -21,7 +34,7 @@ EVAL_STANDARD = True     # Standard accuracy / F1-macro metrics
 EVAL_INTELLIGENT = True   # Win rate-based intelligent rewards
 
 # Toggle self-play mode (model vs model) for the interactive draft section
-SELF_PLAY = True
+SELF_PLAY = False
 
 # Directory containing improved bundles (intelligent-reward retrain)
 IMPROVED_MODELS_DIR = "models/improved_models_intelligent"
