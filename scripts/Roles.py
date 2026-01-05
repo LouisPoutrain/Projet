@@ -14,11 +14,17 @@ from utils_roles import (
 )
 
 # Toggle to run evaluation and exit
-EVAL_MODE = True
+EVAL_MODE = False
 
 # Toggle evaluation types (only active if EVAL_MODE = True)
-EVAL_STANDARD = False     # Standard accuracy / F1-macro metrics
+EVAL_STANDARD = True     # Standard accuracy / F1-macro metrics
 EVAL_INTELLIGENT = True   # Win rate-based intelligent rewards
+
+# Toggle self-play mode (model vs model) for the interactive draft section
+SELF_PLAY = True
+
+# Directory containing improved bundles (intelligent-reward retrain)
+IMPROVED_MODELS_DIR = "models/improved_models_intelligent"
 
 # Toggle to retrain models from scratch (instead of loading from cache)
 RETRAIN_MODE = False
@@ -71,8 +77,13 @@ def main():
 
     # Initialize predictor with selected reward type
     reward_type = "intelligent_reward" if EVAL_INTELLIGENT else "standard"
-    predictor = DraftPredictor(df, reward_type=reward_type, retrain_mode=RETRAIN_MODE, 
-                              champion_roles_map=champion_roles_map)
+    predictor = DraftPredictor(
+        df,
+        reward_type=reward_type,
+        retrain_mode=RETRAIN_MODE,
+        champion_roles_map=champion_roles_map,
+        improved_models_dir=project_root / IMPROVED_MODELS_DIR,
+    )
 
     # Run evaluation and exit if EVAL_MODE is enabled
     if EVAL_MODE:
@@ -103,7 +114,6 @@ def main():
 
     all_bans_and_picks = []
 
-    SELF_PLAY = False
     mode_label = "Self-Play (Model vs Model)" if SELF_PLAY else "Draft Interactive"
     print(f"\n===== Démarrage de la {mode_label} =====\n")
 

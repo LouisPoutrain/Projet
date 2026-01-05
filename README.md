@@ -2,6 +2,18 @@
 
 Ce projet construit un système de prédiction pour la phase de draft de League of Legends (bans/picks), en s'appuyant sur des historiques de matchs (Oracle's Elixir) et un modèle ML supervisé. L'algorithme propose les bans/picks suivants à chaque étape et tient compte des rôles à compléter par équipe.
 
+## Table des matières
+- [Objectif](#objectif)
+- [Données](#données)
+- [Algorithme](#algorithme-vue-densemble)
+- [Installation](#installation)
+- [Préparation des données](#préparation-des-données)
+- [Utilisation](#utilisation)
+- [Évaluation](#évaluation)
+- [Structure des fichiers](#structure-des-fichiers)
+- [Notes et bonnes pratiques](#notes-et-bonnes-pratiques)
+- [Idées d'amélioration](#idées-damélioration)
+
 ## Objectif
 - Prédire les bans et picks successifs pour les équipes Blue/Red.
 - Éviter les doublons en tenant compte des champions déjà utilisés (bans + picks des deux équipes).
@@ -9,105 +21,261 @@ Ce projet construit un système de prédiction pour la phase de draft de League 
 - Affecter automatiquement un rôle à chaque champion pické, y compris les picks flexibles (champions pouvant occuper plusieurs rôles).
 
 ## Données
-- Source principale: CSV Oracle's Elixir (2014 → 2025), présents dans le dossier `CSV/` et à la racine.
-- Fichier fusionné d'entraînement: `csv_games_fusionnes.csv` (issue de la fusion des côtés Blue/Red, colonnes `bb1..bb5`, `rb1..rb5`, `bp1..bp5`, `rp1..rp5`, et la cible `result` ∈ {`b`,`r`}).
-- Mapping des rôles par champion: `champions_by_position.csv` (généré depuis les données Oracle's Elixir).
 
-Fichiers clés du pipeline:
-- [Filtre.py](Filtre.py) → réduit les colonnes des CSV filtrés concaténés vers `draft_dataset_bans_picks.csv`.
-- [Fusion.py](Fusion.py) → fusionne les lignes Blue/Red par `gameid`, crée `csv_games_fusionnes.csv` et la cible `result` (`b` si Blue gagne, sinon `r`).
-- [PrepaRoles.py](PrepaRoles.py) → agrège les apparitions par position et génère `champions_by_position.csv`.
-- [Division.py](Division.py) → optionnel, produit des sous-ensembles progressifs pour analyses/ablation.
+### Source principale
+- **CSV Oracle's Elixir** (2014 → 2025)
+- Fichiers présents dans le dossier `CSV/` et à la racine
+- Colonnes pertinentes : `gameid`, champions des bans/picks, positions, résultats
+
+### Fichiers générés
+- `csv_games_fusionnes.csv` : Dataset d'entraînement fusionné (Blue/Red par `gameid`)
+  - Colonnes : `bb1..bb5` (Blue bans), `rb1..rb5` (Red bans), `bp1..bp5` (Blue picks), `rp1..rp5` (Red picks)
+  - Cible : `result` ∈ {`b`, `r`} (Blue win / Red win)
+- `champions_by_position.csv` : Mapping des rôles par champion
+  - Généré depuis les données Oracle's Elixir
+  - Utilisé pour l'affectation des rôles et la pénalisation
+
+### Pipeline de préparation
+1. **[Filtre.py](Filtre.py)** → Réduit les colonnes des CSV et génère `draft_dataset_bans_picks.csv`
+2. **[Fusion.py](Fusion.py)** → Fusionne Blue/Red par `gameid`, crée `csv_games_fusionnes.csv`
+3. **[PrepaRoles.py](PrepaRoles.py)** → Agrège les positions et génère `champions_by_position.csv`
+4. **[Division.py](Division.py)** → (Optionnel) Produit des sous-ensembles pour analyses
 
 ## Algorithme (vue d'ensemble)
-Implémenté principalement dans [Roles.py](Roles.py):
-- Modèle: `LinearSVC` (scikit-learn) avec features encodées via `OneHotEncoder`.
-- Entraînement par étape: un classifieur est appris pour chaque colonne cible (`bb1`, `rb1`, ..., `bp5`, `rp5`) avec comme features les bans/picks déjà connus à ce moment.
-- Filtrage des classes rares: seules les classes (champions) observées ≥ 2 fois sont utilisées pour l'entraînement.
-- Score → pseudo-proba: on applique `softmax` sur `decision_function` pour obtenir un score par champion.
-- Anti-doublon global: on met à zéro les scores des champions déjà utilisés (bans + picks totaux jusque-là).
-- Pénalisation consciente des rôles:
-  - Si des rôles de l'équipe sont encore vides, on pénalise les champions qui ne peuvent combler aucun rôle manquant (modérément s'ils ont des rôles connus mais non utiles; plus fortement s'ils n'ont aucun rôle connu).
-- Secours: si tous les scores sont nuls (masqués/penalisés), on choisit le premier champion restant disponible.
+
+### Modèle principal
+Implémenté dans **[Roles.py](Roles.py)** :
+- **Modèle** : `LinearSVC` (scikit-learn)
+- **Encodage** : `OneHotEncoder` pour les features catégorielles
+- **Entraînement séquentiel** : Un classifieur par étape de draft (20 classifieurs au total)
+- **Filtrage** : Classes (champions) observées ≥ 2 fois uniquement
+
+### Prédiction intelligente
+1. **Scores normalisés** : `softmax` appliqué sur `decision_function` de SVM
+2. **Anti-doublon global** : Masquage des champions déjà bannis/pickés
+3. **Pénalisation par rôle** :
+   - Favorise les champions comblant des rôles manquants
+   - Pénalise modérément les champions inutiles pour les rôles restants
+   - Pénalise fortement les champions sans rôle connu
+4. **Mécanisme de secours** : Si tous les scores sont nuls, choix du premier champion disponible
 
 ### Affectation des rôles
-- `assign_champion_role()` affecte un rôle:
-  - Si un champion ne peut que 1 rôle non encore pris → assignation directe.
-  - S'il peut plusieurs rôles → pick «flex» (marqué `PROV-...`) à résoudre plus tard.
-  - Si tous ses rôles possibles sont déjà pris → on assigne le premier possible (double rôle).
-- `resolve_flexible_assignments()` résout ensuite les `PROV-...` en tentant d'assigner de manière unique les rôles restants; sinon on choisit le premier rôle disponible.
+- **`assign_champion_role()`** :
+  - 1 rôle possible → Assignation directe
+  - Plusieurs rôles possibles → Pick "flex" (`PROV-...`)
+  - Tous les rôles pris → Double rôle (premier disponible)
+- **`resolve_flexible_assignments()`** :
+  - Résout les picks provisoires
+  - Optimise l'affectation pour éviter les conflits
 
-## Utilisation
-Deux modes sont possibles dans [Roles.py](Roles.py):
-- `SELF_PLAY = True` (par défaut): le modèle prédit tout le draft (modèle vs modèle).
-- `SELF_PLAY = False`: interaction utilisateur, vous saisissez les bans/picks au fur et à mesure.
+## Installation
 
 ### Prérequis
-- Python 3.10+
-- Paquets: `pandas`, `numpy`, `scikit-learn`
-- Données: `csv_games_fusionnes.csv` et `champions_by_position.csv` présents à la racine du projet.
+- **Python 3.10+** (recommandé : 3.11 ou 3.12)
+- **Git** (optionnel, pour le versioning)
+- **Git LFS** (optionnel, pour les gros fichiers CSV)
 
 ### Installation des dépendances
 ```bash
 pip install -r requirements.txt
 ```
 
-### Préparation des données
-1) Filtrer puis fusionner:
+## Préparation des données
+
+### Étape 1 : Filtrage et fusion
 ```bash
 python Filtre.py
 python Fusion.py
 ```
-2) Préparer le mapping rôles:
+Génère `csv_games_fusionnes.csv` avec les 20 colonnes de draft + cible `result`.
+
+### Étape 2 : Mapping des rôles
 ```bash
 python PrepaRoles.py
 ```
-3) (Optionnel) Générer des sous-ensembles:
+Crée `champions_by_position.csv` avec les statistiques de rôles par champion.
+
+### Étape 3 : Division (optionnel)
 ```bash
 python Division.py
 ```
+Produit des sous-ensembles progressifs pour l'analyse d'ablation.
 
-### Exécution
-Lancer la prédiction complète (self-play):
+## Utilisation
+
+### Mode Self-Play (par défaut)
+Le modèle prédit l'intégralité du draft automatiquement :
 ```bash
 python Roles.py
 ```
-Pour passer en mode interactif, éditez `SELF_PLAY` à `False` dans [Roles.py](Roles.py) et relancez.
+
+### Mode Interactif
+Pour interagir et saisir vos propres bans/picks :
+1. Ouvrir `Roles.py`
+2. Modifier la ligne : `SELF_PLAY = False`
+3. Relancer :
+```bash
+python Roles.py
+```
+
+### Scripts de test ML
+Plusieurs variantes de modèles sont disponibles pour comparaison :
+- `TestML.py` : RandomForest
+- `TestML2.py` : LightGBM
+- `TestML3.py` : XGBoost avec hyperparamètres basiques
+- `TestML4.py` : XGBoost optimisé
+- `TestML5.py` : Ensemble de modèles
+- `TestML6.py` : Neural Network avec TensorFlow/Keras
+
+```bash
+python TestML.py  # Exemple avec RandomForest
+```
 
 ## Évaluation
-- **Métrique principale:** exactitude Top-1 par étape (pour chaque cible `bb1`, `rb1`, …, `bp5`, `rp5`), c’est-à-dire la proportion de fois où le champion prédit correspond au champion observé dans `csv_games_fusionnes.csv`.
-- **Protocole conseillé:**
-  - **Split temporel:** entraîner sur les saisons antérieures (ex. 2014–2023) et tester sur 2024–2025 pour respecter les dérives de méta.
-  - **Par-étape:** pour chaque cible, utiliser exactement les features disponibles au moment de la draft (ex. `rb2` s’entraîne avec `bb1`, `rb1`, `bb2`).
-  - **Classes rares:** conserver le filtrage ≥ 2 occurrences pour limiter l’overfitting sur des picks anecdotiques.
-  - **Comparaison de variantes:** mesurer la même métrique pour `LinearSVC` vs alternatives ([TestML.py](TestML.py), [TestML2.py](TestML2.py), [TestMl3.py](TestMl3.py), [TestML4.py](TestML4.py), [TestML5.py](TestML5.py), [TestML6.py](TestML6.py)).
-- **Analyse complémentaire:**
-  - **Impact du masque anti-doublon:** vérifier l’amélioration par rapport à une prédiction naïve sans contrainte.
-  - **Pénalisation des rôles:** comparer l’exactitude des picks avec et sans pénalisation rôle-aware (utile en fin de draft).
-  - **Confusions:** top-5 suggestions et taux de réussite Top-k pour voir si le bon champion est souvent dans le haut du classement.
 
-Exemple de démarche (pseudo-procédure):
-- **Préparer les données:** [Fusion.py](Fusion.py) pour `csv_games_fusionnes.csv`, [PrepaRoles.py](PrepaRoles.py) pour `champions_by_position.csv`.
-- **Boucler sur les 20 cibles:** pour chaque cible, entraîner `LinearSVC`, prédire sur le split de test, calculer l’exactitude.
-- **Reporter les résultats:** tableau par cible et moyenne globale, puis répéter avec les variantes `RandomForest`, `LightGBM`, `XGBoost`.
+### Métrique principale
+**Exactitude Top-1** : Proportion de prédictions correctes par étape de draft
+- Calculée pour chaque cible (`bb1`, `rb1`, ..., `bp5`, `rp5`)
+- Moyenne globale sur les 20 étapes
+
+### Protocole recommandé
+
+#### Split temporel
+```python
+# Entraînement : 2014-2023
+# Test : 2024-2025
+```
+Respecte la dérive de méta du jeu.
+
+#### Entraînement par étape
+- Chaque cible utilise uniquement les features disponibles à son moment
+- Exemple : `rb2` s'entraîne avec `bb1`, `rb1`, `bb2`
+
+#### Gestion des classes rares
+- Filtrage ≥ 2 occurrences pour éviter l'overfitting
+- Amélioration possible : seuil adaptatif selon la saison
+
+### Analyses complémentaires
+
+#### 1. Impact du masque anti-doublon
+Comparer avec/sans contrainte d'unicité des champions.
+
+#### 2. Efficacité de la pénalisation par rôle
+Mesurer l'amélioration de la complétion des compositions.
+
+#### 3. Confusions et Top-K
+- Examiner les top-5 suggestions
+- Calculer l'exactitude Top-3, Top-5
+- Analyser les erreurs fréquentes (champions similaires, rôles flexibles)
+
+### Exemple de procédure d'évaluation
+```python
+# 1. Charger les données
+df_train = pd.read_csv('csv_games_fusionnes.csv')
+df_train = df_train[df_train['year'] <= 2023]
+df_test = pd.read_csv('csv_games_fusionnes.csv')
+df_test = df_test[df_test['year'] >= 2024]
+
+# 2. Boucler sur les 20 cibles
+for target_col in ['bb1', 'rb1', ..., 'bp5', 'rp5']:
+    # Entraîner le modèle
+    # Prédire sur test
+    # Calculer exactitude
+    
+# 3. Reporter les résultats
+print(f"Moyenne globale : {mean_accuracy:.2%}")
+```
 
 ## Structure des fichiers
-- Données brutes: `CSV/20XX_LoL_esports_match_data_from_OraclesElixir.csv` + années 2014–2019 à la racine.
-- Intermédiaires: `csv_filtre_concatenes.csv`, `draft_dataset_bans_picks.csv`, `csv_games_fusionnes.csv`.
-- Rôles: `champions_by_position.csv`.
-- Scripts ML exploratoires: [TestML.py](TestML.py), [TestML2.py](TestML2.py), [TestMl3.py](TestMl3.py), [TestML4.py](TestML4.py), [TestML5.py](TestML5.py), [TestML6.py](TestML6.py) — variantes `RandomForest`, `LightGBM`, `XGBoost`, et `LinearSVC`.
-- Exécution principale: [Roles.py](Roles.py).
+
+```
+Projet/
+├── CSV/
+│   ├── 2020_LoL_esports_match_data_from_OraclesElixir.csv
+│   ├── 2021_LoL_esports_match_data_from_OraclesElixir.csv
+│   └── ... (2014-2025)
+├── 2014_LoL_esports_match_data_from_OraclesElixir.csv
+├── 2015_LoL_esports_match_data_from_OraclesElixir.csv
+├── ... (années à la racine)
+├── csv_filtre_concatenes.csv (intermédiaire)
+├── draft_dataset_bans_picks.csv (intermédiaire)
+├── csv_games_fusionnes.csv (dataset principal)
+├── champions_by_position.csv (mapping rôles)
+├── Filtre.py (préparation)
+├── Fusion.py (préparation)
+├── PrepaRoles.py (préparation)
+├── Division.py (optionnel)
+├── Roles.py (exécution principale)
+├── TestML.py (RandomForest)
+├── TestML2.py (LightGBM)
+├── TestML3.py (XGBoost basique)
+├── TestML4.py (XGBoost optimisé)
+├── TestML5.py (Ensemble)
+├── TestML6.py (Neural Network)
+├── requirements.txt
+└── README.md
+```
 
 ## Notes et bonnes pratiques
-- Les CSV peuvent être volumineux. Si vous poussez sur GitHub, utilisez Git LFS pour les fichiers > 50 Mo.
-- Le modèle `LinearSVC` ne produit pas de probabilités calibrées; l'usage de `softmax` sur `decision_function` fournit des scores comparatifs exploités par l'algorithme.
-- La pénalisation par rôle est heuristique: elle guide les picks vers la complétion des rôles manquants, mais ne garantit pas une optimalité globale.
-- Les résultats dépendent de la qualité/quantité des données (saisons, métas, patchs). Pensez à régénérer `champions_by_position.csv` si vous mettez à jour les données.
+
+### Gestion des gros fichiers
+- Les CSV peuvent dépasser 100 Mo
+- Utiliser **Git LFS** pour les fichiers > 50 Mo :
+```bash
+git lfs install
+git lfs track "*.csv"
+git add .gitattributes
+```
+
+### Limitations du modèle
+- `LinearSVC` ne produit pas de probabilités calibrées
+- Le `softmax` sur `decision_function` fournit des scores comparatifs uniquement
+- La pénalisation par rôle est heuristique, non optimale mathématiquement
+
+### Performance et optimisation
+- Les CSV volumineux peuvent ralentir le chargement
+- Considérer `pandas.read_csv(chunksize=...)` pour très gros fichiers
+- Utiliser `joblib` ou `pickle` pour sauvegarder les modèles entraînés
+
+### Dépendance aux données
+- Les résultats varient selon la saison, le patch, la méta
+- Régénérer `champions_by_position.csv` après chaque mise à jour des données
+- Considérer un système de versioning des datasets
 
 ## Idées d'amélioration
-- Essayer des modèles probabilistes (e.g., `LogisticRegression`, `CatBoost`), calibration (`Platt scaling`).
-- Ajouter des features contextuelles (synergies, contre-picks, patch, ligue, joueur, équipe).
-- Évaluer systématiquement avec un split temporel, validation croisée, ou benchmarking entre variantes `TestML*`.
+
+### Court terme
+- [ ] Implémenter la calibration des probabilités (Platt scaling, isotonic regression)
+- [ ] Ajouter la sauvegarde/chargement des modèles entraînés
+- [ ] Créer un script d'évaluation automatique avec métriques complètes
+- [ ] Générer des graphiques d'analyse (confusion matrices, courbes Top-K)
+
+### Moyen terme
+- [ ] Features contextuelles :
+  - Synergies entre champions pickés
+  - Contre-picks basés sur l'historique
+  - Informations de patch/méta
+  - Statistiques par ligue/équipe/joueur
+- [ ] Modèles alternatifs :
+  - `LogisticRegression` avec régularisation
+  - `CatBoost` pour données catégorielles
+  - Réseaux de neurones récurrents (LSTM) pour séquence de draft
+- [ ] Split de validation :
+  - Validation croisée temporelle
+  - Hyperparameter tuning avec Optuna/GridSearch
+
+### Long terme
+- [ ] Interface web interactive pour simuler des drafts
+- [ ] API REST pour intégration dans d'autres outils
+- [ ] Système de mise à jour automatique des données Oracle's Elixir
+- [ ] Analyse de méta en temps réel basée sur les patchs récents
+- [ ] Système de recommandation multi-objectifs (win rate + style de jeu)
 
 ---
-Si vous souhaitez, je peux ajouter un `requirements.txt`, des scripts d'exécution rapide, ou une évaluation automatique. N'hésitez pas à me le demander !
+
+## Support et contribution
+
+Pour toute question ou suggestion d'amélioration, n'hésitez pas à ouvrir une issue ou à proposer une pull request.
+
+**Auteur** : Louis Poutrain  
+**Dernière mise à jour** : Janvier 2026
