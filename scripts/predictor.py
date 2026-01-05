@@ -6,6 +6,7 @@ import os
 import pickle
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils.extmath import softmax
@@ -19,8 +20,16 @@ class DraftPredictor:
     Supports role-aware predictions with intelligent reward computation.
     """
 
-    def __init__(self, df: pd.DataFrame, model_dir="../models/saved_models", 
-                 reward_type="standard", retrain_mode=False, champion_roles_map=None):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        model_dir="../models/saved_models",
+        reward_type="standard",
+        retrain_mode=False,
+        champion_roles_map=None,
+        prefer_improved_models: bool = True,
+        improved_models_dir: str | None = None,
+    ):
         """
         Initialize DraftPredictor.
         
@@ -37,6 +46,12 @@ class DraftPredictor:
         self.retrain_mode = retrain_mode
         self.champion_roles_map = champion_roles_map or {}
         self.winrate_lookup = load_winrate_lookup()
+
+        self.prefer_improved_models = prefer_improved_models
+        self._bundle_cache = {}
+
+        project_root = Path(__file__).resolve().parents[1]
+        self.improved_models_dir = Path(improved_models_dir) if improved_models_dir else (project_root / "models" / "improved_models")
         
         # Build model directory structure
         base_model_dir = os.path.dirname(model_dir)
@@ -51,6 +66,40 @@ class DraftPredictor:
         
         mode_str = "(RETRAIN MODE)" if self.retrain_mode else ""
         print(f"Using model directory: {self.model_dir_base} {mode_str}")
+
+        if self.prefer_improved_models:
+            print(f"Improved models enabled: {self.improved_models_dir}")
+
+    def _load_improved_bundle(self, target_col: str, feature_cols: list):
+        """Load a per-target bundle saved by scripts/train_and_improve.py.
+
+        Bundle format:
+          - target_col, feature_cols
+          - model, encoder, label_encoder (optional)
+        """
+        bundle_path = self.improved_models_dir / f"{target_col}_bundle.pkl"
+        if not bundle_path.exists():
+            return None
+
+        try:
+            with open(bundle_path, "rb") as f:
+                bundle = pickle.load(f)
+        except Exception as e:
+            print(f"⚠️  Impossible de charger le bundle: {bundle_path} ({e})")
+            return None
+
+        if not isinstance(bundle, dict):
+            return None
+
+        bundle_features = bundle.get("feature_cols")
+        if bundle.get("target_col") != target_col or list(bundle_features or []) != list(feature_cols):
+            # Safety: don't use a bundle trained for a different feature set
+            return None
+
+        if "model" not in bundle or "encoder" not in bundle:
+            return None
+
+        return bundle
 
     def compute_intelligent_reward(self, predicted_champ, actual_champ, my_position, opponent_picks):
         """
@@ -103,6 +152,97 @@ class DraftPredictor:
             str: Predicted champion
         """
         model_encoder_cache_key = f"model_encoder_{target_col}_{result_filter}_{'_'.join(feature_cols)}"
+
+        # 1) Try improved bundle first (if enabled)
+        if self.prefer_improved_models:
+            bundle_cache_key = f"bundle_{target_col}_{'_'.join(feature_cols)}"
+            bundle = self._bundle_cache.get(bundle_cache_key)
+            if bundle is None:
+                bundle = self._load_improved_bundle(target_col, feature_cols)
+                if bundle is not None:
+                    self._bundle_cache[bundle_cache_key] = bundle
+
+            if bundle is not None:
+                model = bundle.get("model")
+                encoder = bundle.get("encoder")
+                label_encoder = bundle.get("label_encoder")
+
+                X_input_df = pd.DataFrame([feature_values], columns=feature_cols)
+                X_input_encoded = encoder.transform(X_input_df)
+
+                # Compute probabilities using available API
+                classes_raw = getattr(model, "classes_", None)
+                probas = None
+
+                if hasattr(model, "decision_function"):
+                    scores = model.decision_function(X_input_encoded)
+                    scores = scores[0] if hasattr(scores, "__len__") else scores
+                    if isinstance(scores, float) or np.ndim(scores) == 0:
+                        scores = np.array([-scores, scores])
+                    probas = softmax([scores])[0]
+                elif hasattr(model, "predict_proba"):
+                    probas = model.predict_proba(X_input_encoded)[0]
+                else:
+                    # Hard fallback: no scores available
+                    pred_raw = model.predict(X_input_encoded)[0]
+                    if label_encoder is not None:
+                        try:
+                            return label_encoder.inverse_transform([int(pred_raw)])[0]
+                        except Exception:
+                            return str(pred_raw)
+                    return pred_raw
+
+                # Determine class labels aligned with probas
+                if classes_raw is None:
+                    # Try to infer from label encoder if sizes match
+                    if label_encoder is not None and len(probas) == len(label_encoder.classes_):
+                        champion_classes = np.array(label_encoder.classes_, dtype=object)
+                    else:
+                        # Cannot align probas to champions safely
+                        pred_raw = model.predict(X_input_encoded)[0]
+                        if label_encoder is not None:
+                            try:
+                                return label_encoder.inverse_transform([int(pred_raw)])[0]
+                            except Exception:
+                                return str(pred_raw)
+                        return pred_raw
+                else:
+                    if label_encoder is not None:
+                        try:
+                            champion_classes = label_encoder.inverse_transform(np.array(classes_raw, dtype=int))
+                        except Exception:
+                            champion_classes = np.array([str(c) for c in classes_raw], dtype=object)
+                    else:
+                        champion_classes = np.array(classes_raw, dtype=object)
+
+                # Remove already-picked champs (global mask)
+                used = set(global_used_champs) if global_used_champs else set()
+                mask = np.array([c not in used for c in champion_classes])
+                probas = probas * mask
+
+                # Role-aware penalization for picks
+                if team_filled_roles is not None:
+                    all_roles = {'top', 'jng', 'mid', 'bot', 'sup'}
+                    unfilled_roles = all_roles - team_filled_roles
+
+                    if len(unfilled_roles) > 0:
+                        for i, champion in enumerate(champion_classes):
+                            if probas[i] > 0:
+                                champion_possible_roles = self.champion_roles_map.get(champion, [])
+                                can_fill_unfilled = any(role in unfilled_roles for role in champion_possible_roles)
+
+                                if not can_fill_unfilled:
+                                    if len(champion_possible_roles) > 0:
+                                        probas[i] *= 0.1  # Moderate penalty
+                                    else:
+                                        probas[i] *= 0.05  # Stronger penalty
+
+                # Fallback if everything is masked
+                if probas.sum() == 0:
+                    remaining = [c for c in champion_classes if c not in used]
+                    return remaining[0] if remaining else champion_classes[0]
+
+                return champion_classes[int(np.argmax(probas))]
         
         # Determine subdirectory: bans or picks
         subdir = "bans" if target_col[1:] in ["b1", "b2", "b3", "b4", "b5"] else "picks"

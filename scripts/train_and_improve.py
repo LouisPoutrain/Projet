@@ -1,6 +1,12 @@
-"""
-Script complet pour entraîner et améliorer les modèles de prédiction de draft LoL.
-Teste et compare plusieurs algorithmes avec validation croisée et optimisation d'hyperparamètres.
+"""scripts/train_and_improve.py
+
+Script pour entraîner et améliorer les modèles de prédiction de draft LoL.
+
+Objectif:
+- Comparer plusieurs algorithmes (baseline + alternatives) pour CHAQUE étape de draft.
+- Sélectionner le meilleur modèle par cible (rb1, bb2, ..., bp5, rp5).
+- Sauvegarder un "bundle" réutilisable pour l'inférence: modèle + OneHotEncoder + LabelEncoder
+    + feature_cols + métadonnées.
 """
 
 import os 
@@ -15,6 +21,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Imports scikit-learn
+from sklearn.base import clone
 from sklearn.svm import LinearSVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
@@ -42,11 +49,91 @@ class ModelComparator:
     Compare plusieurs modèles ML pour prédiction de draft LoL.
     """
     
-    def __init__(self, df, model_dir="../models/saved_models"):
+    def __init__(self, df, model_dir="../models/saved_models", use_xgboost: bool = True):
         self.df = df
         self.model_dir = model_dir
         self.results = {}
         self.best_models = {}
+        self.use_xgboost = bool(use_xgboost)
+
+    @staticmethod
+    def _project_root() -> Path:
+        # scripts/ -> project root
+        return Path(__file__).resolve().parents[1]
+
+    @staticmethod
+    def _recreate_estimator(estimator):
+        """Best-effort recreation of an estimator with same params (safer than clone for some libs)."""
+        try:
+            return clone(estimator)
+        except Exception:
+            try:
+                return estimator.__class__(**estimator.get_params())
+            except Exception:
+                return None
+
+    @staticmethod
+    def _model_keys(models_results: dict):
+        return [k for k in models_results.keys() if k != '_artifacts']
+
+    def _save_best_bundle_for_target(self, target: str, models_results: dict, output_dir: str):
+        if not models_results:
+            return False
+
+        artifacts = models_results.get('_artifacts')
+        if not artifacts:
+            return False
+
+        model_keys = self._model_keys(models_results)
+        if not model_keys:
+            return False
+
+        best_model_name = max(model_keys, key=lambda x: models_results[x]['f1_macro'])
+        best_entry = models_results[best_model_name]
+        fitted_model = best_entry['model']
+
+        X_all = artifacts.get('X_encoded')
+        y_all = artifacts.get('y_encoded')
+        encoder = artifacts.get('encoder')
+        label_encoder = artifacts.get('label_encoder')
+        feature_cols = artifacts.get('feature_cols')
+
+        final_model = self._recreate_estimator(fitted_model)
+        if final_model is None:
+            print(f"  ⚠️  Impossible de re-créer l'estimateur pour {target} ({best_model_name}); sauvegarde du modèle tel quel.")
+            final_model = fitted_model
+        else:
+            try:
+                final_model.fit(X_all, y_all)
+            except Exception as e:
+                print(f"  ⚠️  Ré-entraînement impossible pour {target} ({best_model_name}): {e}; sauvegarde du modèle tel quel.")
+                final_model = fitted_model
+
+        bundle = {
+            'target_col': target,
+            'feature_cols': feature_cols,
+            'model_name': best_model_name,
+            'model': final_model,
+            'encoder': encoder,
+            'label_encoder': label_encoder,
+            'metrics': {
+                'accuracy': float(best_entry.get('accuracy')),
+                'f1_macro': float(best_entry.get('f1_macro')),
+                'precision': float(best_entry.get('precision')),
+                'recall': float(best_entry.get('recall')),
+                'n_samples': int(artifacts.get('n_samples', 0)),
+                'n_classes': int(artifacts.get('n_classes', 0)),
+            },
+            'cv_results': best_entry.get('cv_results'),
+        }
+
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, f"{target}_bundle.pkl")
+        with open(filepath, 'wb') as f:
+            pickle.dump(bundle, f)
+
+        print(f"  💾 Bundle sauvegardé: {filepath}")
+        return True
         
     def prepare_data(self, target_col, feature_cols):
         """
@@ -82,6 +169,35 @@ class ModelComparator:
         y_encoded = label_encoder.fit_transform(y)
 
         return X_encoded, y_encoded, encoder, df_f[mask].index, label_encoder
+
+    @staticmethod
+    def get_draft_target_configs():
+        """Liste ordonnée des cibles et des features disponibles à chaque étape."""
+        return [
+            # Ban phase 1
+            ("rb1", ["bb1"]),
+            ("bb2", ["bb1", "rb1"]),
+            ("rb2", ["bb1", "rb1", "bb2"]),
+            ("bb3", ["bb1", "rb1", "bb2", "rb2"]),
+            ("rb3", ["bb1", "rb1", "bb2", "rb2", "bb3"]),
+            # Pick phase 1
+            ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
+            ("rp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1"]),
+            ("rp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1"]),
+            ("bp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2"]),
+            ("bp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2"]),
+            ("rp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3"]),
+            # Ban phase 2
+            ("rb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3"]),
+            ("bb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4"]),
+            ("rb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4"]),
+            ("bb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5"]),
+            # Pick phase 2
+            ("rp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5"]),
+            ("bp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4"]),
+            ("bp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4"]),
+            ("rp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4", "bp5"]),
+        ]
     
     def evaluate_model(self, model_name, model, X_train, X_test, y_train, y_test):
         """
@@ -191,10 +307,25 @@ class ModelComparator:
         }
         
         if HAS_LIGHTGBM:
-            models['LightGBM'] = LGBMClassifier(n_estimators=100, random_state=42, verbose=-1)
+            models['LightGBM'] = LGBMClassifier(
+                n_estimators=200,
+                learning_rate=0.1,
+                random_state=42,
+                verbose=-1,
+            )
         
-        if HAS_XGBOOST:
-            models['XGBoost'] = XGBClassifier(n_estimators=100, random_state=42, verbose=0)
+        if HAS_XGBOOST and self.use_xgboost:
+            models['XGBoost'] = XGBClassifier(
+                n_estimators=300,
+                learning_rate=0.1,
+                max_depth=6,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=42,
+                n_jobs=2,
+                verbosity=0,
+                eval_metric="mlogloss",
+            )
         
         # Évaluation simple
         if verbose:
@@ -214,8 +345,10 @@ class ModelComparator:
         
         # Validation croisée pour le meilleur modèle
         if results_for_target:
-            best_model_name = max(results_for_target.keys(), 
-                                 key=lambda x: results_for_target[x]['f1_macro'])
+            best_model_name = max(
+                results_for_target.keys(),
+                key=lambda x: results_for_target[x]['f1_macro'],
+            )
             best_model = results_for_target[best_model_name]['model']
             
             if verbose:
@@ -228,29 +361,61 @@ class ModelComparator:
                 print(f"  F1-Macro: {cv_results['f1_macro_mean']:.3f} ± {cv_results['f1_macro_std']:.3f}")
             
             results_for_target[best_model_name]['cv_results'] = cv_results
+
+        # Stocke les artefacts une seule fois (évite de dupliquer X/y dans chaque entrée)
+        results_for_target['_artifacts'] = {
+            'encoder': encoder,
+            'label_encoder': label_encoder,
+            'feature_cols': list(feature_cols),
+            'target_col': target_col,
+            'n_samples': int(X_encoded.shape[0]),
+            'n_classes': int(len(label_encoder.classes_)),
+            'valid_indices': valid_idx,
+            'X_encoded': X_encoded,
+            'y_encoded': y_encoded,
+        }
         
         return results_for_target
     
-    def run_full_evaluation(self, num_targets=5):
+    def run_full_evaluation(
+        self,
+        num_targets=None,
+        only_missing: bool = False,
+        output_dir: str | None = None,
+        save_progressively: bool = True,
+        skip_if_legacy_model_exists: bool = True,
+    ):
         """
-        Évalue les modèles sur les principales cibles.
+        Évalue les modèles sur les cibles de draft.
         """
         print("\n" + "="*70)
         print("🚀 COMPARAISON COMPLÈTE DES MODÈLES")
         print("="*70)
-        
-        # Cibles principales
-        configs = [
-            ("rb1", ["bb1"]),
-            ("bb2", ["bb1", "rb1"]),
-            ("rb2", ["bb1", "rb1", "bb2"]),
-            ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
-            ("rp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1"]),
-        ]
-        
-        for i, (target, features) in enumerate(configs[:num_targets]):
+
+        configs = self.get_draft_target_configs()
+        if num_targets is not None:
+            configs = configs[:num_targets]
+
+        out_dir_path = Path(output_dir) if output_dir else None
+        if only_missing and out_dir_path is not None:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+
+        for target, features in configs:
+            if only_missing and out_dir_path is not None:
+                bundle_path = out_dir_path / f"{target}_bundle.pkl"
+                legacy_path = out_dir_path / f"{target}_model.pkl"
+                if bundle_path.exists():
+                    print(f"\n⏭️  Skip {target}: bundle déjà présent ({bundle_path})")
+                    continue
+                if skip_if_legacy_model_exists and legacy_path.exists():
+                    print(f"\n⏭️  Skip {target}: legacy model présent ({legacy_path})")
+                    continue
             result = self.compare_models_for_target(target, features, verbose=True)
             self.results[target] = result
+
+            if save_progressively and out_dir_path is not None and result:
+                # Sauvegarde le meilleur bundle immédiatement pour ne pas perdre le progrès
+                self._save_best_bundle_for_target(target, result, str(out_dir_path))
         
         # Résumé final
         self.print_summary()
@@ -265,28 +430,41 @@ class ModelComparator:
         
         for target, models_results in self.results.items():
             if models_results:
-                best_model = max(models_results.keys(), 
-                               key=lambda x: models_results[x]['f1_macro'])
+                model_keys = self._model_keys(models_results)
+                if not model_keys:
+                    continue
+                best_model = max(model_keys, key=lambda x: models_results[x]['f1_macro'])
                 best_f1 = models_results[best_model]['f1_macro']
                 print(f"{target}: {best_model} (F1: {best_f1:.3f})")
     
-    def save_best_models(self, output_dir="../models/improved_models"):
+    def save_best_models(self, output_dir=None):
         """
-        Sauvegarde les meilleurs modèles.
+        Sauvegarde les meilleurs modèles sous forme de bundles réutilisables.
+
+        Bundle sauvé (pickle):
+          - target_col
+          - feature_cols
+          - model_name
+          - model (ré-entraîné sur toutes les données valides)
+          - encoder (OneHotEncoder fitted)
+          - label_encoder (LabelEncoder fitted)
+          - metrics (sur split test)
+          - cv_results (si dispo)
         """
+
+        if output_dir is None:
+            output_dir = str(self._project_root() / "models" / "improved_models")
+
         os.makedirs(output_dir, exist_ok=True)
+
+        saved = 0
         
         for target, models_results in self.results.items():
             if models_results:
-                best_model_name = max(models_results.keys(), 
-                                     key=lambda x: models_results[x]['f1_macro'])
-                best_model = models_results[best_model_name]['model']
-                
-                filepath = os.path.join(output_dir, f"{target}_model.pkl")
-                with open(filepath, 'wb') as f:
-                    pickle.dump(best_model, f)
+                if self._save_best_bundle_for_target(target, models_results, output_dir):
+                    saved += 1
         
-        print(f"\n✅ Modèles sauvegardés dans: {output_dir}")
+        print(f"\n✅ Bundles sauvegardés: {saved} | Dossier: {output_dir}")
 
 
 def main():
@@ -297,28 +475,72 @@ def main():
     parser.add_argument(
         "--csv",
         type=str,
-        default="../processed_data/csv_games_fusionnes.csv",
+        default=None,
         help="Chemin vers le fichier csv_games_fusionnes.csv"
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Dossier de sortie pour les bundles (par défaut: models/improved_models à la racine)",
+    )
+    parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Ne réentraîne que les cibles dont le bundle n'existe pas encore dans --output-dir (et, par défaut, skip si legacy *_model.pkl existe).",
+    )
+    parser.add_argument(
+        "--no-skip-legacy",
+        action="store_true",
+        help="Avec --only-missing, ne considère PAS les fichiers legacy *_model.pkl comme existants.",
+    )
+    parser.add_argument(
+        "--no-progress-save",
+        action="store_true",
+        help="Désactive la sauvegarde progressive (par cible).",
+    )
+    parser.add_argument(
+        "--no-xgboost",
+        action="store_true",
+        help="Désactive XGBoost même s'il est installé (accélère l'entraînement).",
+    )
+    parser.add_argument(
+        "--num-targets",
+        type=int,
+        default=None,
+        help="Limiter le nombre de cibles évaluées (par défaut: toutes)",
+    )
     args = parser.parse_args()
+
+    project_root = ModelComparator._project_root()
+    default_csv = project_root / "processed_data" / "csv_games_fusionnes.csv"
+    csv_path = Path(args.csv) if args.csv else default_csv
+
+    effective_output_dir = args.output_dir or str(project_root / "models" / "improved_models")
     
     # Charge les données
     print("📥 Chargement des données...")
-    print(f"📁 Fichier: {args.csv}")
-    
-    if not os.path.exists(args.csv):
-        print(f"❌ Erreur: Le fichier {args.csv} n'existe pas")
+    print(f"📁 Fichier: {csv_path}")
+
+    if not csv_path.exists():
+        print(f"❌ Erreur: Le fichier {csv_path} n'existe pas")
         sys.exit(1)
-    
-    df = pd.read_csv(args.csv)
+
+    df = pd.read_csv(csv_path)
     print(f"✅ Données chargées: {df.shape[0]} lignes, {df.shape[1]} colonnes")
     
     # Lance la comparaison
-    comparator = ModelComparator(df)
-    comparator.run_full_evaluation(num_targets=5)
+    comparator = ModelComparator(df, use_xgboost=not args.no_xgboost)
+    comparator.run_full_evaluation(
+        num_targets=args.num_targets,
+        only_missing=args.only_missing,
+        output_dir=effective_output_dir,
+        save_progressively=not args.no_progress_save,
+        skip_if_legacy_model_exists=not args.no_skip_legacy,
+    )
     
     # Sauvegarde les meilleurs modèles
-    comparator.save_best_models()
+    comparator.save_best_models(output_dir=effective_output_dir)
     
     print("\n" + "="*70)
     print("✨ Script d'amélioration terminé!")

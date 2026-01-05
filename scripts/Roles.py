@@ -2,6 +2,7 @@
 Main script for LoL esports draft prediction.
 Uses modular components: predictor.py, evaluator.py, utils_roles.py
 """
+from pathlib import Path
 import pandas as pd
 from predictor import DraftPredictor
 from evaluator import evaluate_all_targets, evaluate_with_intelligent_rewards
@@ -10,7 +11,6 @@ from utils_roles import (
     assign_champion_role,
     get_user_champion_input,
     resolve_flexible_assignments,
-    load_winrate_lookup
 )
 
 # Toggle to run evaluation and exit
@@ -30,15 +30,16 @@ RETRAIN_MODE = False
 
 def main():
     """Main execution flow for draft prediction."""
-    
+
+    project_root = Path(__file__).resolve().parents[1]
+
     # Load data
-    df = pd.read_csv("../processed_data/csv_games_fusionnes.csv")
+    df = pd.read_csv(project_root / "processed_data" / "csv_games_fusionnes.csv")
     
     # Load champion roles map
     champion_roles_map = {}
-    champion_lookup = {}
     try:
-        roles_df = pd.read_csv('../processed_data/champions_by_position.csv')
+        roles_df = pd.read_csv(project_root / "processed_data" / "champions_by_position.csv")
         for index, row in roles_df.iterrows():
             position = row['Position']
             champions_str = row['Champions']
@@ -47,12 +48,26 @@ def main():
                 if champion not in champion_roles_map:
                     champion_roles_map[champion] = []
                 champion_roles_map[champion].append(position)
-                norm = normalize_champion_name(champion)
-                if norm not in champion_lookup:
-                    champion_lookup[norm] = champion
         print(f"Loaded {len(champion_roles_map)} champions with role information")
     except Exception as e:
         print(f"Warning: Could not load champion roles: {e}")
+
+    def _apply_ban(team_bans, ban_value, all_used, label):
+        team_bans.append(ban_value)
+        all_used.append(ban_value)
+        print(f"{label} = {ban_value}")
+
+    def _apply_pick(team_picks, pick_value, team_assigned_roles, team_filled_roles, flexible_champions, all_used, label):
+        team_picks.append(pick_value)
+        assigned = assign_champion_role(
+            pick_value,
+            team_assigned_roles,
+            team_filled_roles,
+            champion_roles_map,
+            flexible_champions,
+        )
+        all_used.append(pick_value)
+        print(f"{label} = {pick_value} ({assigned})")
 
     # Initialize predictor with selected reward type
     reward_type = "intelligent_reward" if EVAL_INTELLIGENT else "standard"
@@ -98,42 +113,30 @@ def main():
     else:
         bb1 = get_user_champion_input("Blue Team Ban 1 (bb1): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_bans.append(bb1)
-    all_bans_and_picks.append(bb1)
-    print(f"bb1 = {bb1}")
+    _apply_ban(blue_team_bans, bb1, all_bans_and_picks, "bb1")
 
     rb1 = predictor.predict_rb1(bb1, global_used_champs=all_bans_and_picks)
-    red_team_bans.append(rb1)
-    all_bans_and_picks.append(rb1)
-    print(f"rb1 = {rb1}")
+    _apply_ban(red_team_bans, rb1, all_bans_and_picks, "rb1")
 
     if SELF_PLAY:
         bb2 = predictor.predict_bb2(bb1, rb1, global_used_champs=all_bans_and_picks)
     else:
         bb2 = get_user_champion_input("Blue Team Ban 2 (bb2): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_bans.append(bb2)
-    all_bans_and_picks.append(bb2)
-    print(f"bb2 = {bb2}")
+    _apply_ban(blue_team_bans, bb2, all_bans_and_picks, "bb2")
 
     rb2 = predictor.predict_rb2(bb1, rb1, bb2, global_used_champs=all_bans_and_picks)
-    red_team_bans.append(rb2)
-    all_bans_and_picks.append(rb2)
-    print(f"rb2 = {rb2}")
+    _apply_ban(red_team_bans, rb2, all_bans_and_picks, "rb2")
 
     if SELF_PLAY:
         bb3 = predictor.predict_bb3(bb1, rb1, bb2, rb2, global_used_champs=all_bans_and_picks)
     else:
         bb3 = get_user_champion_input("Blue Team Ban 3 (bb3): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_bans.append(bb3)
-    all_bans_and_picks.append(bb3)
-    print(f"bb3 = {bb3}")
+    _apply_ban(blue_team_bans, bb3, all_bans_and_picks, "bb3")
 
     rb3 = predictor.predict_rb3(bb1, rb1, bb2, rb2, bb3, global_used_champs=all_bans_and_picks)
-    red_team_bans.append(rb3)
-    all_bans_and_picks.append(rb3)
-    print(f"rb3 = {rb3}")
+    _apply_ban(red_team_bans, rb3, all_bans_and_picks, "rb3")
 
     # Pick Phase 1
     if SELF_PLAY:
@@ -143,29 +146,41 @@ def main():
     else:
         bp1 = get_user_champion_input("Blue Team Pick 1 (bp1): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_picks.append(bp1)
-    assigned_role_bp1 = assign_champion_role(bp1, blue_team_assigned_roles, blue_team_filled_roles, 
-                                             champion_roles_map, blue_team_flexible_champions)
-    all_bans_and_picks.append(bp1)
-    print(f"bp1 = {bp1} ({assigned_role_bp1})")
+    _apply_pick(
+        blue_team_picks,
+        bp1,
+        blue_team_assigned_roles,
+        blue_team_filled_roles,
+        blue_team_flexible_champions,
+        all_bans_and_picks,
+        "bp1",
+    )
 
     rp1 = predictor.predict_rp1(bb1, rb1, bb2, rb2, bb3, rb3, bp1,
                                 red_team_filled_roles=red_team_filled_roles,
                                 global_used_champs=all_bans_and_picks)
-    red_team_picks.append(rp1)
-    assigned_role_rp1 = assign_champion_role(rp1, red_team_assigned_roles, red_team_filled_roles, 
-                                             champion_roles_map, red_team_flexible_champions)
-    all_bans_and_picks.append(rp1)
-    print(f"rp1 = {rp1} ({assigned_role_rp1})")
+    _apply_pick(
+        red_team_picks,
+        rp1,
+        red_team_assigned_roles,
+        red_team_filled_roles,
+        red_team_flexible_champions,
+        all_bans_and_picks,
+        "rp1",
+    )
 
     rp2 = predictor.predict_rp2(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1,
                                 red_team_filled_roles=red_team_filled_roles,
                                 global_used_champs=all_bans_and_picks)
-    red_team_picks.append(rp2)
-    assigned_role_rp2 = assign_champion_role(rp2, red_team_assigned_roles, red_team_filled_roles, 
-                                             champion_roles_map, red_team_flexible_champions)
-    all_bans_and_picks.append(rp2)
-    print(f"rp2 = {rp2} ({assigned_role_rp2})")
+    _apply_pick(
+        red_team_picks,
+        rp2,
+        red_team_assigned_roles,
+        red_team_filled_roles,
+        red_team_flexible_champions,
+        all_bans_and_picks,
+        "rp2",
+    )
 
     if SELF_PLAY:
         bp2 = predictor.predict_bp2(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2,
@@ -174,11 +189,15 @@ def main():
     else:
         bp2 = get_user_champion_input("Blue Team Pick 2 (bp2): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_picks.append(bp2)
-    assigned_role_bp2 = assign_champion_role(bp2, blue_team_assigned_roles, blue_team_filled_roles, 
-                                             champion_roles_map, blue_team_flexible_champions)
-    all_bans_and_picks.append(bp2)
-    print(f"bp2 = {bp2} ({assigned_role_bp2})")
+    _apply_pick(
+        blue_team_picks,
+        bp2,
+        blue_team_assigned_roles,
+        blue_team_filled_roles,
+        blue_team_flexible_champions,
+        all_bans_and_picks,
+        "bp2",
+    )
 
     if SELF_PLAY:
         bp3 = predictor.predict_bp3(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2,
@@ -187,27 +206,33 @@ def main():
     else:
         bp3 = get_user_champion_input("Blue Team Pick 3 (bp3): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_picks.append(bp3)
-    assigned_role_bp3 = assign_champion_role(bp3, blue_team_assigned_roles, blue_team_filled_roles, 
-                                             champion_roles_map, blue_team_flexible_champions)
-    all_bans_and_picks.append(bp3)
-    print(f"bp3 = {bp3} ({assigned_role_bp3})")
+    _apply_pick(
+        blue_team_picks,
+        bp3,
+        blue_team_assigned_roles,
+        blue_team_filled_roles,
+        blue_team_flexible_champions,
+        all_bans_and_picks,
+        "bp3",
+    )
 
     rp3 = predictor.predict_rp3(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3,
                                 red_team_filled_roles=red_team_filled_roles,
                                 global_used_champs=all_bans_and_picks)
-    red_team_picks.append(rp3)
-    assigned_role_rp3 = assign_champion_role(rp3, red_team_assigned_roles, red_team_filled_roles, 
-                                             champion_roles_map, red_team_flexible_champions)
-    all_bans_and_picks.append(rp3)
-    print(f"rp3 = {rp3} ({assigned_role_rp3})")
+    _apply_pick(
+        red_team_picks,
+        rp3,
+        red_team_assigned_roles,
+        red_team_filled_roles,
+        red_team_flexible_champions,
+        all_bans_and_picks,
+        "rp3",
+    )
 
     # Ban Phase 2
     rb4 = predictor.predict_rb4(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3,
                                 global_used_champs=all_bans_and_picks)
-    red_team_bans.append(rb4)
-    all_bans_and_picks.append(rb4)
-    print(f"rb4 = {rb4}")
+    _apply_ban(red_team_bans, rb4, all_bans_and_picks, "rb4")
 
     if SELF_PLAY:
         bb4 = predictor.predict_bb4(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3,
@@ -215,15 +240,11 @@ def main():
     else:
         bb4 = get_user_champion_input("Blue Team Ban 4 (bb4): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_bans.append(bb4)
-    all_bans_and_picks.append(bb4)
-    print(f"bb4 = {bb4}")
+    _apply_ban(blue_team_bans, bb4, all_bans_and_picks, "bb4")
 
     rb5 = predictor.predict_rb5(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3, rb4, bb4,
                                 global_used_champs=all_bans_and_picks)
-    red_team_bans.append(rb5)
-    all_bans_and_picks.append(rb5)
-    print(f"rb5 = {rb5}")
+    _apply_ban(red_team_bans, rb5, all_bans_and_picks, "rb5")
 
     if SELF_PLAY:
         bb5 = predictor.predict_bb5(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3,
@@ -231,19 +252,21 @@ def main():
     else:
         bb5 = get_user_champion_input("Blue Team Ban 5 (bb5): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_bans.append(bb5)
-    all_bans_and_picks.append(bb5)
-    print(f"bb5 = {bb5}")
+    _apply_ban(blue_team_bans, bb5, all_bans_and_picks, "bb5")
 
     # Pick Phase 2
     rp4 = predictor.predict_rp4(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3, rb4, bb4, rb5, bb5,
                                 red_team_filled_roles=red_team_filled_roles,
                                 global_used_champs=all_bans_and_picks)
-    red_team_picks.append(rp4)
-    assigned_role_rp4 = assign_champion_role(rp4, red_team_assigned_roles, red_team_filled_roles, 
-                                             champion_roles_map, red_team_flexible_champions)
-    all_bans_and_picks.append(rp4)
-    print(f"rp4 = {rp4} ({assigned_role_rp4})")
+    _apply_pick(
+        red_team_picks,
+        rp4,
+        red_team_assigned_roles,
+        red_team_filled_roles,
+        red_team_flexible_champions,
+        all_bans_and_picks,
+        "rp4",
+    )
 
     if SELF_PLAY:
         bp4 = predictor.predict_bp4(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3,
@@ -253,11 +276,15 @@ def main():
     else:
         bp4 = get_user_champion_input("Blue Team Pick 4 (bp4): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_picks.append(bp4)
-    assigned_role_bp4 = assign_champion_role(bp4, blue_team_assigned_roles, blue_team_filled_roles, 
-                                             champion_roles_map, blue_team_flexible_champions)
-    all_bans_and_picks.append(bp4)
-    print(f"bp4 = {bp4} ({assigned_role_bp4})")
+    _apply_pick(
+        blue_team_picks,
+        bp4,
+        blue_team_assigned_roles,
+        blue_team_filled_roles,
+        blue_team_flexible_champions,
+        all_bans_and_picks,
+        "bp4",
+    )
 
     if SELF_PLAY:
         bp5 = predictor.predict_bp5(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3,
@@ -267,20 +294,28 @@ def main():
     else:
         bp5 = get_user_champion_input("Blue Team Pick 5 (bp5): ", blue_team_filled_roles, 
                                        all_bans_and_picks, champion_roles_map)
-    blue_team_picks.append(bp5)
-    assigned_role_bp5 = assign_champion_role(bp5, blue_team_assigned_roles, blue_team_filled_roles, 
-                                             champion_roles_map, blue_team_flexible_champions)
-    all_bans_and_picks.append(bp5)
-    print(f"bp5 = {bp5} ({assigned_role_bp5})")
+    _apply_pick(
+        blue_team_picks,
+        bp5,
+        blue_team_assigned_roles,
+        blue_team_filled_roles,
+        blue_team_flexible_champions,
+        all_bans_and_picks,
+        "bp5",
+    )
 
     rp5 = predictor.predict_rp5(bb1, rb1, bb2, rb2, bb3, rb3, bp1, rp1, rp2, bp2, bp3, rp3, rb4, bb4, rb5, bb5, rp4, bp4, bp5,
                                 red_team_filled_roles=red_team_filled_roles,
                                 global_used_champs=all_bans_and_picks)
-    red_team_picks.append(rp5)
-    assigned_role_rp5 = assign_champion_role(rp5, red_team_assigned_roles, red_team_filled_roles, 
-                                             champion_roles_map, red_team_flexible_champions)
-    all_bans_and_picks.append(rp5)
-    print(f"rp5 = {rp5} ({assigned_role_rp5})")
+    _apply_pick(
+        red_team_picks,
+        rp5,
+        red_team_assigned_roles,
+        red_team_filled_roles,
+        red_team_flexible_champions,
+        all_bans_and_picks,
+        "rp5",
+    )
 
     # Resolve flexible assignments
     print("\nResolving flexible champion roles for Blue Team...")

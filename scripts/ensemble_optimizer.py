@@ -9,10 +9,12 @@ import argparse
 import pickle
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.svm import LinearSVC
 from sklearn.ensemble import (
     RandomForestClassifier, VotingClassifier, StackingClassifier, AdaBoostClassifier
 )
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 from sklearn.model_selection import train_test_split, cross_validate
 from sklearn.linear_model import LogisticRegression
@@ -41,6 +43,35 @@ class EnsembleOptimizer:
     def __init__(self, df):
         self.df = df
         self.results = {}
+
+    @staticmethod
+    def _project_root() -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    @staticmethod
+    def get_draft_target_configs():
+        """Liste ordonnée des cibles et des features disponibles à chaque étape."""
+        return [
+            ("rb1", ["bb1"]),
+            ("bb2", ["bb1", "rb1"]),
+            ("rb2", ["bb1", "rb1", "bb2"]),
+            ("bb3", ["bb1", "rb1", "bb2", "rb2"]),
+            ("rb3", ["bb1", "rb1", "bb2", "rb2", "bb3"]),
+            ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
+            ("rp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1"]),
+            ("rp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1"]),
+            ("bp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2"]),
+            ("bp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2"]),
+            ("rp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3"]),
+            ("rb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3"]),
+            ("bb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4"]),
+            ("rb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4"]),
+            ("bb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5"]),
+            ("rp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5"]),
+            ("bp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4"]),
+            ("bp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4"]),
+            ("rp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4", "bp5"]),
+        ]
     
     def prepare_data(self, target_col, feature_cols):
         """Prépare les données."""
@@ -72,8 +103,15 @@ class EnsembleOptimizer:
         """
         Crée un Voting Classifier avec plusieurs algorithmes.
         """
+        # Soft voting nécessite predict_proba -> on calibre LinearSVC
+        svc = CalibratedClassifierCV(
+            estimator=LinearSVC(C=1.0, max_iter=5000, dual=True, random_state=42),
+            method="sigmoid",
+            cv=3,
+        )
+
         estimators = [
-            ('svc', LinearSVC(C=1.0, max_iter=5000, dual=True, random_state=42)),
+            ('svc', svc),
             ('rf', RandomForestClassifier(
                 n_estimators=50,
                 max_depth=20,
@@ -92,15 +130,22 @@ class EnsembleOptimizer:
         if HAS_XGBOOST:
             estimators.append(('xgb', XGBClassifier(n_estimators=100, random_state=42, verbose=0)))
         
-        return VotingClassifier(estimators=estimators, voting='soft')
+        return VotingClassifier(estimators=estimators, voting='soft', n_jobs=1)
     
     def create_stacking_classifier(self):
         """
         Crée un Stacking Classifier.
         Les prédictions des modèles de base sont combinées par un meta-learner.
         """
+        # Pour empiler sur des probabilités, chaque base estimator doit exposer predict_proba
+        svc = CalibratedClassifierCV(
+            estimator=LinearSVC(C=1.0, max_iter=5000, dual=True, random_state=42),
+            method="sigmoid",
+            cv=3,
+        )
+
         base_estimators = [
-            ('svc', LinearSVC(C=1.0, max_iter=5000, dual=True, random_state=42, probability=False)),
+            ('svc', svc),
             ('rf', RandomForestClassifier(
                 n_estimators=50,
                 max_depth=20,
@@ -123,7 +168,8 @@ class EnsembleOptimizer:
             estimators=base_estimators,
             final_estimator=meta_learner,
             cv=3,  # Réduit de 5 à 3
-            n_jobs=1  # Limite parallélisme
+            n_jobs=1,  # Limite parallélisme
+            stack_method='predict_proba'
         )
     
     def evaluate_ensemble(self, name, ensemble, X_train, X_test, y_train, y_test):
@@ -193,9 +239,18 @@ class EnsembleOptimizer:
                 print(f"    ✅ Acc: {stacking_results['accuracy']:.3f} | "
                       f"F1: {stacking_results['f1_macro']:.3f}")
         
+        # Inject preprocessing artefacts pour export bundle
+        for entry in results.values():
+            entry['target_col'] = target_col
+            entry['feature_cols'] = list(feature_cols)
+            entry['encoder'] = encoder
+            entry['label_encoder'] = label_encoder
+            entry['n_samples'] = int(X_encoded.shape[0])
+            entry['n_classes'] = int(len(label_encoder.classes_))
+
         return results
     
-    def run_full_optimization(self, num_targets=5):
+    def run_full_optimization(self, num_targets=None):
         """
         Exécute l'optimisation complète sur plusieurs cibles.
         """
@@ -203,15 +258,11 @@ class EnsembleOptimizer:
         print("🚀 ENSEMBLE LEARNING - OPTIMISATION COMPLÈTE")
         print("="*70)
         
-        configs = [
-            ("rb1", ["bb1"]),
-            ("bb2", ["bb1", "rb1"]),
-            ("rb2", ["bb1", "rb1", "bb2"]),
-            ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
-            ("rp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1"]),
-        ]
-        
-        for target, features in configs[:num_targets]:
+        configs = self.get_draft_target_configs()
+        if num_targets is not None:
+            configs = configs[:num_targets]
+
+        for target, features in configs:
             result = self.optimize_target(target, features, verbose=True)
             self.results[target] = result
         
@@ -233,23 +284,48 @@ class EnsembleOptimizer:
                 best_acc = ensembles[best_name]['accuracy']
                 print(f"{target}: {best_name:15} | F1: {best_f1:.3f} | Acc: {best_acc:.3f}")
     
-    def save_best_ensembles(self, output_dir="../models/ensemble_models"):
+    def save_best_ensembles(self, output_dir=None):
         """
-        Sauvegarde les meilleurs ensembles.
+        Sauvegarde les meilleurs ensembles sous forme de bundles compatibles predictor.
         """
+
+        if output_dir is None:
+            output_dir = str(self._project_root() / "models" / "improved_models")
+
         os.makedirs(output_dir, exist_ok=True)
+
+        saved = 0
         
         for target, ensembles in self.results.items():
             if ensembles:
                 best_name = max(ensembles.keys(), 
                                key=lambda x: ensembles[x]['f1_macro'])
                 best_model = ensembles[best_name]['model']
-                
-                filepath = os.path.join(output_dir, f"{target}_{best_name}_ensemble.pkl")
+
+                best_entry = ensembles[best_name]
+                bundle = {
+                    'target_col': target,
+                    'feature_cols': best_entry.get('feature_cols'),
+                    'model_name': best_name,
+                    'model': best_model,
+                    'encoder': best_entry.get('encoder'),
+                    'label_encoder': best_entry.get('label_encoder'),
+                    'metrics': {
+                        'accuracy': float(best_entry.get('accuracy')),
+                        'f1_macro': float(best_entry.get('f1_macro')),
+                        'precision': float(best_entry.get('precision')),
+                        'recall': float(best_entry.get('recall')),
+                        'n_samples': int(best_entry.get('n_samples', 0)),
+                        'n_classes': int(best_entry.get('n_classes', 0)),
+                    },
+                }
+
+                filepath = os.path.join(output_dir, f"{target}_bundle.pkl")
                 with open(filepath, 'wb') as f:
-                    pickle.dump(best_model, f)
+                    pickle.dump(bundle, f)
+                saved += 1
         
-        print(f"\n✅ Ensembles sauvegardés dans: {output_dir}")
+        print(f"\n✅ Bundles (ensembles) sauvegardés: {saved} | Dossier: {output_dir}")
 
 
 def main():
@@ -258,24 +334,40 @@ def main():
     parser.add_argument(
         "--csv",
         type=str,
-        default="../processed_data/csv_games_fusionnes.csv",
+        default=None,
         help="Chemin vers le fichier csv_games_fusionnes.csv"
     )
+    parser.add_argument(
+        "--num-targets",
+        type=int,
+        default=None,
+        help="Limiter le nombre de cibles (par défaut: toutes)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Dossier de sortie pour les bundles (par défaut: models/improved_models)",
+    )
     args = parser.parse_args()
+
+    project_root = EnsembleOptimizer._project_root()
+    default_csv = project_root / "processed_data" / "csv_games_fusionnes.csv"
+    csv_path = Path(args.csv) if args.csv else default_csv
     
     print("📥 Chargement des données...")
-    print(f"📁 Fichier: {args.csv}")
-    
-    if not os.path.exists(args.csv):
-        print(f"❌ Erreur: Le fichier {args.csv} n'existe pas")
+    print(f"📁 Fichier: {csv_path}")
+
+    if not csv_path.exists():
+        print(f"❌ Erreur: Le fichier {csv_path} n'existe pas")
         sys.exit(1)
-    
-    df = pd.read_csv(args.csv)
+
+    df = pd.read_csv(csv_path)
     print(f"✅ Données chargées: {df.shape[0]} lignes")
     
     optimizer = EnsembleOptimizer(df)
-    optimizer.run_full_optimization(num_targets=5)
-    optimizer.save_best_ensembles()
+    optimizer.run_full_optimization(num_targets=args.num_targets)
+    optimizer.save_best_ensembles(output_dir=args.output_dir)
     
     print("\n" + "="*70)
     print("✨ Ensemble Learning terminé!")

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML artifacts / caches
+models/catboost_info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

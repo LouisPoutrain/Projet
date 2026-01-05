@@ -7,6 +7,7 @@ import sys
 import argparse
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.svm import LinearSVC
@@ -32,6 +33,35 @@ class HyperparameterOptimizer:
     def __init__(self, df):
         self.df = df
         self.best_params = {}
+
+    @staticmethod
+    def _project_root() -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    @staticmethod
+    def get_draft_target_configs():
+        """Liste ordonnée des cibles et des features disponibles à chaque étape."""
+        return [
+            ("rb1", ["bb1"]),
+            ("bb2", ["bb1", "rb1"]),
+            ("rb2", ["bb1", "rb1", "bb2"]),
+            ("bb3", ["bb1", "rb1", "bb2", "rb2"]),
+            ("rb3", ["bb1", "rb1", "bb2", "rb2", "bb3"]),
+            ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
+            ("rp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1"]),
+            ("rp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1"]),
+            ("bp2", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2"]),
+            ("bp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2"]),
+            ("rp3", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3"]),
+            ("rb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3"]),
+            ("bb4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4"]),
+            ("rb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4"]),
+            ("bb5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5"]),
+            ("rp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5"]),
+            ("bp4", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4"]),
+            ("bp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4"]),
+            ("rp5", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3", "bp1", "rp1", "rp2", "bp2", "bp3", "rp3", "rb4", "bb4", "rb5", "bb5", "rp4", "bp4", "bp5"]),
+        ]
     
     def prepare_data(self, target_col, feature_cols):
         """Prépare les données."""
@@ -164,6 +194,125 @@ class HyperparameterOptimizer:
             print(f"    ❌ Erreur: {e}")
         
         return results
+
+    def train_and_save_best_for_target(
+        self,
+        target_col,
+        feature_cols,
+        n_trials=50,
+        output_dir=None,
+        prefer_metric="cv_f1_macro",
+    ):
+        """Optimise puis entraîne le meilleur modèle et sauvegarde un bundle compatible predictor."""
+        X, y, encoder, label_encoder = self.prepare_data(target_col, feature_cols)
+        if X is None:
+            print(f"  ⚠️  Données insuffisantes pour {target_col}")
+            return None
+
+        # Optimisation des hyperparamètres
+        results = self.optimize_target(target_col, feature_cols, n_trials=n_trials)
+        if not results:
+            return None
+
+        # Construire candidats (modèle + params) et scorer en CV
+        candidates = []
+        if 'LinearSVC_best' in results:
+            C = float(results['LinearSVC_best'].get('C', 1.0))
+            candidates.append((
+                'LinearSVC_tuned',
+                LinearSVC(C=C, max_iter=5000, dual=True, random_state=42),
+            ))
+        if 'RandomForest_best' in results:
+            p = results['RandomForest_best']
+            candidates.append((
+                'RandomForest_tuned',
+                RandomForestClassifier(
+                    n_estimators=int(p.get('n_estimators', 50)),
+                    max_depth=int(p.get('max_depth', 20)),
+                    min_samples_split=int(p.get('min_samples_split', 10)),
+                    min_samples_leaf=int(p.get('min_samples_leaf', 5)),
+                    max_features='sqrt',
+                    random_state=42,
+                    n_jobs=2,
+                ),
+            ))
+
+        if not candidates:
+            return None
+
+        best_name = None
+        best_model = None
+        best_cv = -1.0
+        for name, model in candidates:
+            try:
+                scores = cross_val_score(model, X, y, cv=5, scoring='f1_macro', n_jobs=1)
+                score = float(scores.mean())
+                print(f"  🔁 CV check {name}: f1_macro={score:.4f}")
+                if score > best_cv:
+                    best_cv = score
+                    best_name = name
+                    best_model = model
+            except Exception as e:
+                print(f"  ❌ CV error {name}: {e}")
+
+        if best_model is None:
+            return None
+
+        # Entraînement final sur toutes les données
+        try:
+            best_model.fit(X, y)
+        except Exception as e:
+            print(f"  ❌ Entraînement final échoué pour {target_col}: {e}")
+            return None
+
+        # Chemin output
+        if output_dir is None:
+            output_dir = str(self._project_root() / "models" / "improved_models")
+        os.makedirs(output_dir, exist_ok=True)
+
+        bundle = {
+            'target_col': target_col,
+            'feature_cols': list(feature_cols),
+            'model_name': best_name,
+            'model': best_model,
+            'encoder': encoder,
+            'label_encoder': label_encoder,
+            'metrics': {
+                'cv_f1_macro': float(best_cv),
+                'n_samples': int(X.shape[0]),
+                'n_classes': int(len(label_encoder.classes_)),
+            },
+        }
+
+        out_path = os.path.join(output_dir, f"{target_col}_bundle.pkl")
+        with open(out_path, 'wb') as f:
+            import pickle
+            pickle.dump(bundle, f)
+
+        print(f"  ✅ Bundle sauvegardé: {out_path}")
+        return bundle
+
+    def run_full_optimization_and_save(self, n_trials=50, num_targets=None, output_dir=None):
+        configs = self.get_draft_target_configs()
+        if num_targets is not None:
+            configs = configs[:num_targets]
+
+        print("\n" + "="*70)
+        print("🚀 OPTIMISATION + EXPORT BUNDLES (toutes les étapes)")
+        print("="*70)
+
+        saved = 0
+        for target, features in configs:
+            res = self.train_and_save_best_for_target(
+                target,
+                features,
+                n_trials=n_trials,
+                output_dir=output_dir,
+            )
+            if res is not None:
+                saved += 1
+
+        print(f"\n✅ Terminé. Bundles sauvegardés: {saved}/{len(configs)}")
     
     def run_optimization(self, targets_and_features, n_trials=50):
         """
@@ -187,32 +336,50 @@ def main():
     parser.add_argument(
         "--csv",
         type=str,
-        default="../processed_data/csv_games_fusionnes.csv",
+        default=None,
         help="Chemin vers le fichier csv_games_fusionnes.csv"
     )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=50,
+        help="Nombre de trials Optuna (si dispo) par cible",
+    )
+    parser.add_argument(
+        "--num-targets",
+        type=int,
+        default=None,
+        help="Limiter le nombre de cibles (par défaut: toutes)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Dossier de sortie pour les bundles (par défaut: models/improved_models)",
+    )
     args = parser.parse_args()
-    
+
+    project_root = HyperparameterOptimizer._project_root()
+    default_csv = project_root / "processed_data" / "csv_games_fusionnes.csv"
+    csv_path = Path(args.csv) if args.csv else default_csv
+
     print("📥 Chargement des données...")
-    print(f"📁 Fichier: {args.csv}")
-    
-    if not os.path.exists(args.csv):
-        print(f"❌ Erreur: Le fichier {args.csv} n'existe pas")
+    print(f"📁 Fichier: {csv_path}")
+
+    if not csv_path.exists():
+        print(f"❌ Erreur: Le fichier {csv_path} n'existe pas")
         sys.exit(1)
-    
-    df = pd.read_csv(args.csv)
+
+    df = pd.read_csv(csv_path)
     print(f"✅ Données chargées: {df.shape[0]} lignes")
     
     optimizer = HyperparameterOptimizer(df)
-    
-    # Cibles à optimiser
-    targets = [
-        ("rb1", ["bb1"]),
-        ("bb2", ["bb1", "rb1"]),
-        ("rb2", ["bb1", "rb1", "bb2"]),
-        ("bp1", ["bb1", "rb1", "bb2", "rb2", "bb3", "rb3"]),
-    ]
-    
-    optimizer.run_optimization(targets, n_trials=50)
+
+    optimizer.run_full_optimization_and_save(
+        n_trials=args.n_trials,
+        num_targets=args.num_targets,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
